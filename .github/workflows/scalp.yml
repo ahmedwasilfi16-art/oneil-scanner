@@ -1,0 +1,27 @@
+name: Scalp ORB VWAP
+
+on:
+  schedule:
+    - cron: "5 13 * * 1-5"
+    - cron: "5 14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test or now"
+        default: "test"
+
+jobs:
+  scalp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run scalper
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scalper.py ${{ github.event.inputs.mode }}
