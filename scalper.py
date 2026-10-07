@@ -31,6 +31,13 @@ CFG = {
     "min_avg_vol": 500_000,  # أقل متوسط فوليوم يومي
     "max_watch": 15,         # أقصى عدد أسهم بيراقبها
     "poll": 60,              # بيبص كل كام ثانية
+    # خطة قبل الفتح (كسر سقف البري ماركت)
+    "plan_at": "09:25",      # ميعاد رسالة الخطة
+    "plan_max": 5,           # أقصى عدد أسهم في الخطة
+    "plan_buffer": 0.1,      # الدخول فوق سقف البري ماركت بالنسبة دي %
+    "plan_min_risk": 1.0,    # أقل مسافة للستوب %
+    "plan_max_risk": 4.0,    # أقصى مسافة للستوب %
+    "plan_expire": "10:00",  # لو مكسرش لحد الوقت ده الخطة تتلغي
 }
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -170,7 +177,8 @@ def premarket_scan(cfg=CFG):
             if pc <= 0 or last < cfg["min_price"] or vol < cfg["pm_min_vol"]:
                 continue
             gap = (last / pc - 1) * 100
-            rec = {"t": t, "gap": gap, "price": last, "vol": vol, "pmh": float(pre["High"].max())}
+            rec = {"t": t, "gap": gap, "price": last, "vol": vol, "pmh": float(pre["High"].max()),
+                   "pvwap": premarket_vwap(pre)}
             if gap >= cfg["gap_min"]:
                 ups.append(rec)
             elif gap <= -cfg["gap_min"]:
@@ -182,6 +190,105 @@ def premarket_scan(cfg=CFG):
 
 def vol_str(v):
     return f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v / 1e3:.0f}K"
+
+
+def premarket_vwap(pre):
+    vol = pre["Volume"].sum()
+    if vol <= 0:
+        return None
+    tp = (pre["High"] + pre["Low"] + pre["Close"]) / 3
+    return float((tp * pre["Volume"]).sum() / vol)
+
+
+# ===================== خطة قبل الفتح =====================
+def refresh_premarket(recs, now):
+    """يحدّث سقف البري ماركت والـ VWAP بتاعه قبل الفتح بدقايق"""
+    tickers = [r["t"] for r in recs]
+    try:
+        frames = get_bars(tickers, period="1d")
+    except Exception as e:
+        print("تعذر تحديث البري ماركت:", e)
+        return recs
+    for r in recs:
+        df = frames.get(r["t"])
+        if df is None:
+            continue
+        pre = df[(df.index.date == now.date())].between_time("04:00", "09:29")
+        if len(pre) == 0:
+            continue
+        r["pmh"] = float(pre["High"].max())
+        r["price"] = float(pre["Close"].iloc[-1])
+        r["pvwap"] = premarket_vwap(pre)
+    return recs
+
+
+def make_plan(r, cfg=CFG):
+    """دخول فوق سقف البري ماركت، ستوب عند VWAP البري ماركت بين حد أدنى وأقصى، هدف ضعف المخاطرة"""
+    pmh = r["pmh"]
+    entry = round(pmh * (1 + cfg["plan_buffer"] / 100) + 0.01, 2)
+    lo = entry * (1 - cfg["plan_max_risk"] / 100)
+    hi = entry * (1 - cfg["plan_min_risk"] / 100)
+    pv = r.get("pvwap") or lo
+    stop = round(min(max(pv, lo), hi), 2)
+    pos = position(entry, stop, cfg)
+    if not pos:
+        return None
+    target, qty = pos
+    return {"entry": entry, "stop": stop, "target": round(target, 2), "qty": qty, "state": None, "last": None}
+
+
+def plan_message(plans, recs):
+    lines = ["📋 خطة قبل الفتح — حط الأوامر دي قبل 9:30",
+             "أمر Buy Stop عند سعر الدخول (صالح لليوم). لو السهم مكسرش السقف، الأمر مش هيتنفذ.", ""]
+    for r in recs:
+        p = plans.get(r["t"])
+        if not p:
+            continue
+        lines.append(f"• {r['t']} (+{r['gap']:.1f}%) | سقف البري {fmt(r['pmh'])}")
+        lines.append(f"   دخول {fmt(p['entry'])} | ستوب {fmt(p['stop'])} | هدف {fmt(p['target'])} | كمية {p['qty']}")
+    lines.append("")
+    lines.append(f"لو مكسرش لحد {CFG['plan_expire']} هبعتلك تلغي الأمر. ولو اتنفذ هبلّغك تحط الستوب والهدف.")
+    lines.append("⚠️ خطة للمراجعة مش توصية — بص على الشارت قبل ما تحط الأمر.")
+    return "\n".join(lines)
+
+
+def track_plan(t, p, df1, now, cfg=CFG):
+    """بيتابع خطة واحدة على شموع الدقيقة المكتملة بعد الفتح"""
+    msgs = []
+    if p["state"] in ("closed", "cancelled"):
+        return msgs
+    day = df1[(df1.index.date == now.date())].between_time("09:30", "15:59")
+    day = day[[ts + dt.timedelta(minutes=1) <= now for ts in day.index]]
+    if p["last"] is not None:
+        day = day[day.index > p["last"]]
+    h, m = map(int, cfg["plan_expire"].split(":"))
+    expire = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    for ts, b in day.iterrows():
+        p["last"] = ts
+        if p["state"] is None:
+            if b["High"] >= p["entry"]:
+                p["state"] = "open"
+                msgs.append(f"⚡ اتنفذ: {t} كسر سقف البري ماركت وعدّى {fmt(p['entry'])} الساعة {ts:%H:%M}\n"
+                            f"حط دلوقتي أمر Stop Loss عند {fmt(p['stop'])} وبيع عند الهدف {fmt(p['target'])}")
+                continue
+            if b["Low"] <= p["stop"]:
+                p["state"] = "cancelled"; p["result"] = "اتلغت"
+                msgs.append(f"❌ الغي أمر {t}: نزل تحت {fmt(p['stop'])} قبل ما يكسر — الخطة باظت")
+                break
+            if ts + dt.timedelta(minutes=1) >= expire:
+                p["state"] = "cancelled"; p["result"] = "مكسرش"
+                msgs.append(f"⌛ الغي أمر {t}: مكسرش {fmt(p['entry'])} لحد {cfg['plan_expire']}")
+                break
+        elif p["state"] == "open":
+            if b["Low"] <= p["stop"]:
+                p["state"] = "closed"; p["result"] = "ستوب"
+                msgs.append(f"🔴 ستوب خطة: {t} لمس {fmt(p['stop'])} — اخرج لو لسه جوه")
+                break
+            if b["High"] >= p["target"]:
+                p["state"] = "closed"; p["result"] = "هدف"
+                msgs.append(f"✅ هدف خطة: {t} وصل {fmt(p['target'])} — خد الربح")
+                break
+    return msgs
 
 
 # ===================== المنطق =====================
@@ -263,6 +370,7 @@ def main(force=False):
         return news[sym]
 
     pre_watch = []
+    ups = []
     if now_ny() < today_at("09:25"):
         sleep_until(today_at("09:12"))
         ups, downs = premarket_scan()
@@ -283,24 +391,46 @@ def main(force=False):
                 lines.extend(top)
         send("\n".join(lines))
 
-    sleep_until(today_at("09:36"))
-    movers, chg = screen_movers()
-    watch = list(dict.fromkeys(pre_watch + movers))[:20]
-    note = ""
-    if not watch:
-        watch = FALLBACK
-        note = "(قايمة احتياطية — مقدرتش أجيب الأسهم الطالعة)"
-    lines = ["🔔 بدأ رصد السكالبنج " + note, "القايمة النهائية:"]
-    for s in watch:
-        mood, dil, top = add_news(s)
-        c = chg.get(s, 0.0)
-        lines.append(f"• {s} (+{c:.1f}%) {mood}" if c else f"• {s} {mood}")
-    send("\n".join(lines))
+    # خطة قبل الفتح: أقوى الفجوات الطالعة، من غير أسهم فيها خبر طرح أسهم
+    plans = {}
+    if ups and now_ny() < today_at("09:29"):
+        sleep_until(today_at(CFG["plan_at"]))
+        cands = [r for r in ups if not news.get(r["t"], ("", False, []))[1]][: CFG["plan_max"]]
+        cands = refresh_premarket(cands, now_ny())
+        for r in cands:
+            p = make_plan(r)
+            if p:
+                plans[r["t"]] = p
+        if plans:
+            send(plan_message(plans, cands))
 
+    # المراقبة بتبدأ مع الفتح، والقايمة النهائية بتتضاف الساعة 9:36
+    sleep_until(today_at("09:30"))
+    watch = list(dict.fromkeys(list(plans) + pre_watch))[:20]
     states = {t: {} for t in watch}
+    movers_done = False
     end = today_at(CFG["end"])
     got_data = False
     while now_ny() < end:
+        if not movers_done and now_ny() >= today_at("09:36"):
+            movers_done = True
+            movers, chg = screen_movers()
+            watch = list(dict.fromkeys(list(plans) + pre_watch + movers))[:20]
+            note = ""
+            if not watch:
+                watch = FALLBACK
+                note = "(قايمة احتياطية — مقدرتش أجيب الأسهم الطالعة)"
+            for t in watch:
+                states.setdefault(t, {})
+            lines = ["🔔 بدأ رصد السكالبنج " + note, "القايمة النهائية:"]
+            for s in watch:
+                mood, dil, top = add_news(s)
+                c = chg.get(s, 0.0)
+                lines.append(f"• {s} (+{c:.1f}%) {mood}" if c else f"• {s} {mood}")
+            send("\n".join(lines))
+        if not watch:
+            time.sleep(CFG["poll"])
+            continue
         try:
             frames = get_bars(watch)
         except Exception as e:
@@ -312,8 +442,14 @@ def main(force=False):
             send("📴 مفيش بيانات النهارده — غالبًا السوق أجازة.")
             return
         for t, df in frames.items():
+            nn = now_ny()
+            if t in plans:
+                try:
+                    for m in track_plan(t, plans[t], df, nn):
+                        send(m)
+                except Exception as e:
+                    print("تخطي خطة", t, e)
             try:
-                nn = now_ny()
                 for m in evaluate(t, states[t], build_5m(df, nn), pmh=premarket_high(df, nn)):
                     if m.startswith("🟢"):
                         mood, dil, _ = news.get(t, ("", False, []))
@@ -327,6 +463,16 @@ def main(force=False):
 
     lines = ["🏁 البوت وقف الرصد. ملخص النهارده:"]
     any_sig = False
+    for t, p in plans.items():
+        any_sig = True
+        if p["state"] == "open":
+            lines.append(f"• خطة {t}: لسه مفتوحة — ستوب {fmt(p['stop'])} | هدف {fmt(p['target'])}. حط الأوامر دي في روبن هود.")
+        elif p["state"] is None:
+            lines.append(f"• خطة {t}: متنفذتش — الغي الأمر لو لسه موجود")
+        elif p["state"] == "cancelled":
+            lines.append(f"• خطة {t}: اتلغت ({p.get('result')})")
+        else:
+            lines.append(f"• خطة {t}: دخول {fmt(p['entry'])} ← {p.get('result')}")
     for t, st in states.items():
         if "entry" not in st:
             continue
