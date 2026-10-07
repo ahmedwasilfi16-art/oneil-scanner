@@ -38,6 +38,12 @@ CFG = {
     "plan_min_risk": 1.0,    # أقل مسافة للستوب %
     "plan_max_risk": 4.0,    # أقصى مسافة للستوب %
     "plan_expire": "10:00",  # لو مكسرش لحد الوقت ده الخطة تتلغي
+    # الدخول على الرجوع (بعد أي كسر من الخطة أو من ORB)
+    "pb_enabled": True,      # خليها False عشان تقفل إشارات الرجوع
+    "pb_min_run": 1.0,       # لازم السهم يطلع فوق مستوى الكسر بالنسبة دي % الأول
+    "pb_zone": 0.5,          # منطقة الرجوع حوالين مستوى الكسر % (لو قفل تحتها بالنسبة دي الرجوع يبوظ)
+    "pb_min_risk": 1.0,      # أقل مسافة للستوب %
+    "pb_max_risk": 3.0,      # أقصى مسافة للستوب %
 }
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -268,6 +274,7 @@ def track_plan(t, p, df1, now, cfg=CFG):
         if p["state"] is None:
             if b["High"] >= p["entry"]:
                 p["state"] = "open"
+                p["fill_ts"] = ts
                 msgs.append(f"⚡ اتنفذ: {t} كسر سقف البري ماركت وعدّى {fmt(p['entry'])} الساعة {ts:%H:%M}\n"
                             f"حط دلوقتي أمر Stop Loss عند {fmt(p['stop'])} وبيع عند الهدف {fmt(p['target'])}")
                 continue
@@ -288,6 +295,80 @@ def track_plan(t, p, df1, now, cfg=CFG):
                 p["state"] = "closed"; p["result"] = "هدف"
                 msgs.append(f"✅ هدف خطة: {t} وصل {fmt(p['target'])} — خد الربح")
                 break
+    return msgs
+
+
+# ===================== الدخول على الرجوع =====================
+def new_pullback(level, since):
+    return {"level": level, "since": since, "hi": level, "state": "watch", "low": None, "prev_hi": None}
+
+
+def track_pullback(t, pb, df1, now, cfg=CFG):
+    """بعد الكسر: يستنى السهم يطلع، يرجع يلمس مستوى الكسر، ويرتد فوقه"""
+    msgs = []
+    if pb["state"] in ("closed", "failed", "expired"):
+        return msgs
+    day = df1[(df1.index.date == now.date())].between_time("09:30", "15:59")
+    if len(day) == 0:
+        return msgs
+    tp = (day["High"] + day["Low"] + day["Close"]) / 3
+    vwap = (tp * day["Volume"]).cumsum() / day["Volume"].cumsum().replace(0, float("nan"))
+    done = [ts + dt.timedelta(minutes=1) <= now for ts in day.index]
+    day, vwap = day[done], vwap[done]
+    new = day.index > pb["since"]
+    day, vwap = day[new], vwap[new]
+    L = pb["level"]
+    zone = cfg["pb_zone"] / 100
+    h, m = map(int, cfg["last_entry"].split(":"))
+    last_entry = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    for ts, b in day.iterrows():
+        vw = float(vwap[ts]) if vwap[ts] == vwap[ts] else float(b["Close"])
+        pb["since"] = ts
+        if pb["state"] == "open":
+            if b["Low"] <= pb["stop"]:
+                pb["state"] = "closed"; pb["result"] = "ستوب"
+                msgs.append(f"🔴 ستوب رجوع: {t} لمس {fmt(pb['stop'])} — اخرج لو لسه جوه")
+                break
+            if b["High"] >= pb["target"]:
+                pb["state"] = "closed"; pb["result"] = "هدف"
+                msgs.append(f"✅ هدف رجوع: {t} وصل {fmt(pb['target'])} — خد الربح")
+                break
+            continue
+        if ts >= last_entry:
+            pb["state"] = "expired"
+            break
+        if pb["state"] == "watch":
+            pb["hi"] = max(pb["hi"], float(b["High"]))
+            if pb["hi"] >= L * (1 + cfg["pb_min_run"] / 100) and b["Low"] <= L * (1 + zone):
+                pb["state"] = "touched"
+                pb["low"] = float(b["Low"])
+        elif pb["state"] == "touched":
+            pb["low"] = min(pb["low"], float(b["Low"]))
+            if b["Close"] < L * (1 - zone):
+                pb["state"] = "failed"
+                break
+            if b["Close"] > pb["prev_hi"] and b["Close"] > L:
+                entry = round(float(b["Close"]), 2)
+                base = min(pb["low"] - 0.01, L * (1 - zone))
+                stop = min(max(base, entry * (1 - cfg["pb_max_risk"] / 100)),
+                           entry * (1 - cfg["pb_min_risk"] / 100))
+                pos = position(entry, stop, cfg)
+                if not pos:
+                    pb["state"] = "failed"
+                    break
+                target, qty = pos
+                pb.update(state="open", entry=entry, stop=round(stop, 2), target=round(target, 2), qty=qty)
+                msgs.append(
+                    f"🔁 دخول على الرجوع: {t}\nدخول {fmt(entry)} | ستوب {fmt(pb['stop'])} | هدف {fmt(pb['target'])} | كمية {qty}\n"
+                    f"رجع لمستوى الكسر {fmt(L)} وارتد فوقه | VWAP {fmt(vw)} | أعلى سعر بعد الكسر {fmt(pb['hi'])}\n"
+                    f"⚠️ لو السعر دلوقتي بعيد عن سعر الدخول بأكتر من نص المسافة للهدف، فوّتها"
+                )
+                if entry < vw:
+                    msgs[-1] += "\n⚠️ السعر لسه تحت الـ VWAP — الارتداد أضعف، خليك حذر"
+                if pb["hi"] < pb["target"]:
+                    msgs[-1] += f"\n🧱 أعلى سعر قبل كده {fmt(pb['hi'])} قبل الهدف — ممكن تاخد ربح جزئي عنده"
+                break
+        pb["prev_hi"] = float(b["High"])
     return msgs
 
 
@@ -408,6 +489,7 @@ def main(force=False):
     sleep_until(today_at("09:30"))
     watch = list(dict.fromkeys(list(plans) + pre_watch))[:20]
     states = {t: {} for t in watch}
+    pullbacks = {}
     movers_done = False
     end = today_at(CFG["end"])
     got_data = False
@@ -443,22 +525,36 @@ def main(force=False):
             return
         for t, df in frames.items():
             nn = now_ny()
+            dil_t = news.get(t, ("", False, []))[1]
             if t in plans:
                 try:
                     for m in track_plan(t, plans[t], df, nn):
                         send(m)
+                    p = plans[t]
+                    if CFG["pb_enabled"] and "fill_ts" in p and t not in pullbacks and not dil_t:
+                        pullbacks[t] = new_pullback(p["entry"], p["fill_ts"])
                 except Exception as e:
                     print("تخطي خطة", t, e)
             try:
-                for m in evaluate(t, states[t], build_5m(df, nn), pmh=premarket_high(df, nn)):
+                bars = build_5m(df, nn)
+                for m in evaluate(t, states[t], bars, pmh=premarket_high(df, nn)):
                     if m.startswith("🟢"):
                         mood, dil, _ = news.get(t, ("", False, []))
                         m += f"\nالأخبار: {mood}"
                         if dil:
                             m += "\n⛔ فيه خبر طرح أسهم — السهم ممكن يقع فجأة، الأفضل تفوّتها"
+                        if CFG["pb_enabled"] and t not in pullbacks and not dil_t:
+                            pullbacks[t] = new_pullback(float(bars["High"].iloc[0]),
+                                                        bars.index[-1] + dt.timedelta(minutes=4))
                     send(m)
             except Exception as e:
                 print("تخطي", t, e)
+            if t in pullbacks:
+                try:
+                    for m in track_pullback(t, pullbacks[t], df, nn):
+                        send(m)
+                except Exception as e:
+                    print("تخطي رجوع", t, e)
         time.sleep(CFG["poll"])
 
     lines = ["🏁 البوت وقف الرصد. ملخص النهارده:"]
@@ -473,6 +569,14 @@ def main(force=False):
             lines.append(f"• خطة {t}: اتلغت ({p.get('result')})")
         else:
             lines.append(f"• خطة {t}: دخول {fmt(p['entry'])} ← {p.get('result')}")
+    for t, pb in pullbacks.items():
+        if "entry" not in pb:
+            continue
+        any_sig = True
+        if pb["state"] == "open":
+            lines.append(f"• رجوع {t}: لسه مفتوحة — ستوب {fmt(pb['stop'])} | هدف {fmt(pb['target'])}. حط الأوامر دي في روبن هود.")
+        else:
+            lines.append(f"• رجوع {t}: دخول {fmt(pb['entry'])} ← {pb.get('result')}")
     for t, st in states.items():
         if "entry" not in st:
             continue
