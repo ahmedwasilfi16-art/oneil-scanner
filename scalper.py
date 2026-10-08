@@ -32,6 +32,7 @@ CFG = {
     "max_watch": 15,         # أقصى عدد أسهم بيراقبها
     "poll": 60,              # بيبص كل كام ثانية
     # خطة قبل الفتح (كسر سقف البري ماركت)
+    "pre_scan_at": "09:05",  # فحص البري ماركت بيبدأ الساعة دي (الرسالة بتوصل بعده بدقايق)
     "plan_at": "09:25",      # ميعاد رسالة الخطة
     "plan_max": 5,           # أقصى عدد أسهم في الخطة
     "plan_buffer": 0.1,      # الدخول فوق سقف البري ماركت بالنسبة دي %
@@ -163,6 +164,10 @@ def premarket_high(df1, now):
 def premarket_scan(cfg=CFG):
     from scanner import universe
     tickers = universe()
+    # الأسهم الصغيرة اللي بيحفظها بوت الأسهم الصغيرة كل ليلة
+    if os.path.exists("small_universe.txt"):
+        with open("small_universe.txt") as f:
+            tickers = sorted(set(tickers) | {l.strip() for l in f if l.strip()})
     today = now_ny().date()
     ups, downs = [], []
     for i in range(0, len(tickers), 200):
@@ -453,7 +458,7 @@ def main(force=False):
     pre_watch = []
     ups = []
     if now_ny() < today_at("09:25"):
-        sleep_until(today_at("09:12"))
+        sleep_until(today_at(CFG["pre_scan_at"]))
         ups, downs = premarket_scan()
         lines = ["🌅 البري ماركت — الأسهم الفاتحة بفجوة طالعة:"]
         for r in ups:
