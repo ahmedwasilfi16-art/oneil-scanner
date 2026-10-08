@@ -1,13 +1,16 @@
 # الأخبار ومواعيد الأرباح — مشترك بين بوت السوينج وبوت السكالبنج
 import datetime as dt
 
+import requests
 import yfinance as yf
 
 POS = ["beats", "beat estimates", "tops estimates", "raises guidance", "raises outlook", "raises forecast",
        "record revenue", "record quarter", "upgrade", "upgraded", "price target raised", "fda approval",
        "fda approves", "approved by fda", "clearance", "partnership", "strategic agreement", "awarded",
        "wins contract", "contract", "buyback", "repurchase", "to be acquired", "acquisition by",
-       "surges", "soars", "jumps", "rallies", "breakthrough"]
+       "surges", "soars", "jumps", "rallies", "breakthrough", "secures", "loan commitment", "grant",
+       "department of defense", "selected by", "exceeds", "above expectations", "higher than expected",
+       "record", "strategic investment"]
 NEG = ["misses", "missed estimates", "falls short", "cuts guidance", "lowers guidance", "cuts outlook",
        "lowers outlook", "downgrade", "downgraded", "price target cut", "lawsuit", "investigation", "probe",
        "subpoena", "recall", "bankruptcy", "chapter 11", "delist", "going concern", "plunges", "tumbles",
@@ -52,19 +55,74 @@ def tag_titles(titles):
     return mood, dil
 
 
-def news_summary(ticker, hours=48, max_n=2):
-    """يرجّع: التصنيف، فيه تخفيف ولا لأ، وأهم العناوين"""
+# ===================== أخبار تريدنج فيو =====================
+TV_NEWS = "https://news-headlines.tradingview.com/v2/headlines"
+TV_SCAN = "https://scanner.tradingview.com/america/scan"
+UA = {"User-Agent": "Mozilla/5.0 (scanner)"}
+MAIN_EX = ("NASDAQ", "NYSE", "AMEX")
+_SYM = {}
+
+
+def tv_symbol(ticker):
+    """تريدنج فيو محتاج البورصة قبل السهم (NASDAQ:PROF)، فبنجيبها مرة وبنحفظها"""
+    if ":" in ticker:
+        return ticker
+    if ticker in _SYM:
+        return _SYM[ticker]
+    body = {"markets": ["america"], "columns": ["name"], "range": [0, 10],
+            "filter": [{"left": "name", "operation": "equal", "right": ticker.replace("-", ".")}]}
+    sym = None
+    try:
+        rows = requests.post(TV_SCAN, json=body, headers=UA, timeout=20).json().get("data") or []
+        main = [r["s"] for r in rows if r["s"].split(":")[0] in MAIN_EX]
+        sym = (main or [r["s"] for r in rows] or [None])[0]
+    except Exception as e:
+        print("تعذر تحديد بورصة", ticker, e)
+    _SYM[ticker] = sym
+    return sym
+
+
+def tv_titles(sym, cutoff):
+    r = requests.get(TV_NEWS, params={"client": "web", "lang": "en", "symbol": sym}, headers=UA, timeout=20)
+    r.raise_for_status()
+    out = []
+    for it in r.json().get("items") or []:
+        title = it.get("title") or ""
+        when = dt.datetime.fromtimestamp(it["published"], tz=dt.timezone.utc) if it.get("published") else None
+        if not title or (when is not None and when < cutoff):
+            continue
+        prov = it.get("provider")
+        source = prov.get("name") if isinstance(prov, dict) else (it.get("source") or prov or "")
+        out.append((title, when, source))
+    return out
+
+
+def yahoo_titles(ticker, cutoff):
     try:
         items = yf.Ticker(ticker).news or []
     except Exception:
         items = []
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
-    titles = []
+    out = []
     for it in items:
         title, when, source = _parse(it)
         if not title or (when is not None and when < cutoff):
             continue
-        titles.append((title, when, source))
+        out.append((title, when, source))
+    return out
+
+
+def news_summary(ticker, hours=48, max_n=2, sym=None):
+    """يرجّع: التصنيف، فيه تخفيف ولا لأ، وأهم العناوين — من تريدنج فيو، ولو فشل من ياهو"""
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    titles = None
+    try:
+        s = sym or tv_symbol(ticker)
+        if s:
+            titles = tv_titles(s, cutoff)
+    except Exception as e:
+        print("أخبار تريدنج فيو مش متاحة لـ", ticker, e)
+    if titles is None:
+        titles = yahoo_titles(ticker, cutoff)
     mood, dil = tag_titles([t[0] for t in titles])
     top = []
     for title, when, source in titles[:max_n]:
