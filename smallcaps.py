@@ -70,6 +70,7 @@ def tv_scan(filters, sort_by=None, asc=False, n=50, cols=TV_COLS):
         if not re.fullmatch(r"[A-Z]{1,5}(-[A-Z])?", t) or t[-2:] in ("-U", "-W", "-R"):
             continue
         d["t"] = t
+        d["sym"] = row.get("s")
         out.append(d)
     return out
 
@@ -99,7 +100,7 @@ def build_universe(cfg=CFG):
 
 
 def add_news(r, max_n=1):
-    r["mood"], r["dil"], r["top"] = news_summary(r["t"], hours=24, max_n=max_n)
+    r["mood"], r["dil"], r["top"] = news_summary(r["t"], hours=24, max_n=max_n, sym=r.get("sym"))
     r["has_news"] = bool(r["top"])
     note = earnings_note(r["t"], warn_days=1)
     r["earn"] = note if "⚠️" in note else ""
@@ -155,7 +156,7 @@ def tv_morning(cfg=CFG):
         print("تعذر تحميل شموع البري ماركت:", e)
         frames = {}
     for r in rows:
-        rec = {"t": r["t"], "name": r.get("description") or "", "gap": num(r["premarket_change"]),
+        rec = {"t": r["t"], "sym": r.get("sym"), "name": r.get("description") or "", "gap": num(r["premarket_change"]),
                "price": num(r["premarket_close"]), "vol": num(r["premarket_volume"]),
                "pmh": num(r["premarket_high"]) or num(r["premarket_close"]),
                "ah": num(r.get("postmarket_change")), "mcap": num(r.get("market_cap_basic")), "pvwap": None}
